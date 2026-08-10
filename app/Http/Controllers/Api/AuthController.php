@@ -124,6 +124,7 @@ class AuthController extends Controller
                 'message' => 'OTP dikirim ke email Anda. Silakan verifikasi untuk melanjutkan login.',
                 'data' => [
                     'requires_otp' => true,
+                    'otp' => app()->environment('local') ? $otp : null,
                     'user' => $this->userPayload($user),
                 ],
             ], 200);
