@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Mail\OtpMail;
 use App\Models\LoginActivity;
 use App\Models\SsoSession;
 use App\Models\User;
@@ -11,6 +12,7 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 
 class AuthController extends Controller
@@ -105,6 +107,28 @@ class AuthController extends Controller
             ], 401);
         }
 
+        if ($this->shouldRequireOtp($user)) {
+            $otp = (string) random_int(100000, 999999);
+            Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
+
+            try {
+                Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
+            } catch (\Throwable $e) {
+                report($e);
+            }
+
+            $this->logLoginActivity($user->id, $user->username, 'pending_otp', null, $request);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'OTP dikirim ke email Anda. Silakan verifikasi untuk melanjutkan login.',
+                'data' => [
+                    'requires_otp' => true,
+                    'user' => $this->userPayload($user),
+                ],
+            ], 200);
+        }
+
         // 3. Semua valid -> langsung buat sesi aktif (tanpa tahap aktivasi terpisah).
         $activeMinutes = (int) config('sso.session_active_minutes', 15);
         $refreshDays = (int) config('sso.refresh_token_days', 7);
@@ -127,6 +151,71 @@ class AuthController extends Controller
                 'expires_in' => $activeMinutes * 60,
                 'session_id' => $session->id,
                 'status' => 'active',
+                'requires_otp' => false,
+                'user' => $this->userPayload($user),
+            ],
+        ], 201);
+    }
+
+    public function verifyOtp(Request $request)
+    {
+        $username = $request->input('username');
+        $otp = $request->input('otp');
+
+        if (! $username || ! $otp) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username dan OTP wajib diisi',
+            ], 400);
+        }
+
+        $user = User::where('username', $username)->first();
+        if (! $user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Pengguna tidak ditemukan',
+            ], 404);
+        }
+
+        $expectedOtp = Cache::get("otp:{$user->username}");
+        if ($expectedOtp === null) {
+            return response()->json([
+                'success' => false,
+                'message' => 'OTP tidak valid atau sudah kadaluarsa',
+            ], 400);
+        }
+
+        if ((string) $otp !== (string) $expectedOtp) {
+            return response()->json([
+                'success' => false,
+                'message' => 'OTP tidak sesuai',
+            ], 400);
+        }
+
+        Cache::forget("otp:{$user->username}");
+
+        $activeMinutes = (int) config('sso.session_active_minutes', 15);
+        $refreshDays = (int) config('sso.refresh_token_days', 7);
+        $now = now();
+
+        $session = SsoSession::create([
+            'user_id' => $user->id,
+            'status' => 'active',
+            'refresh_token' => $this->generateRefreshToken(),
+            'refresh_expires_at' => $now->copy()->addDays($refreshDays),
+            'expires_at' => $now->copy()->addMinutes($activeMinutes),
+        ]);
+
+        $this->logLoginActivity($user->id, $user->username, 'success', 'otp_verified', $request);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'refresh_token' => $session->refresh_token,
+                'expires_in' => $activeMinutes * 60,
+                'session_id' => $session->id,
+                'status' => 'active',
+                'requires_otp' => false,
                 'user' => $this->userPayload($user),
             ],
         ], 201);
@@ -346,15 +435,22 @@ class AuthController extends Controller
     private function userPayload(?User $user): array
     {
         if (! $user) {
-            return ['username' => null, 'modul_akses' => []];
+            return ['username' => null, 'email' => null, 'role' => null, 'modul_akses' => []];
         }
 
         return [
             'username' => $user->username,
+            'email' => $user->email,
+            'role' => $user->role,
             'modul_akses' => $user->modules()->get(['modules.code', 'modules.name', 'modules.url'])
                 ->map(fn ($m) => ['code' => $m->code, 'name' => $m->name, 'url' => $m->url])
                 ->values(),
         ];
+    }
+
+    private function shouldRequireOtp(User $user): bool
+    {
+        return $user->role === 'super_user' && filled($user->email);
     }
 
     private function generateRefreshToken(): string

@@ -14,6 +14,8 @@ return new class extends Migration
             $table->uuid('id')->primary();
             $table->string('username')->unique();
             $table->string('password_hash');
+            $table->string('email')->nullable();
+            $table->string('role')->default('user');
             $table->timestamp('created_at')->useCurrent();
         });
     }

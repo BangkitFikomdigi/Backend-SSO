@@ -20,6 +20,7 @@ Route::get('/health', [AuthController::class, 'health']);
 Route::prefix('auth')->group(function () {
     Route::get('/captcha', [AuthController::class, 'captcha']);
     Route::post('/login', [AuthController::class, 'login']);
+    Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
     Route::post('/activate', [AuthController::class, 'activate']);
     Route::post('/session', [AuthController::class, 'session']);
     Route::post('/validate', [AuthController::class, 'validateToken']);
