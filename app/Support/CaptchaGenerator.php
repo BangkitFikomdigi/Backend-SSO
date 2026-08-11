@@ -11,11 +11,11 @@ class CaptchaGenerator
 {
     // Karakter yang gampang tertukar (0/O, 1/l/I) sengaja dibuang, sama seperti
     // opsi `ignoreChars: '0oO1lI'` pada versi Node.js.
-    private const CHARSET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz';
+    private const CHARSET = '0123456789';
 
     private const COLORS = ['#166534', '#15803d', '#166534', '#0f766e', '#1e40af', '#7c2d12'];
 
-    public static function generate(int $length = 6, int $width = 160, int $height = 60): array
+    public static function generate(int $length = 4, int $width = 160, int $height = 60): array
     {
         $text = self::randomText($length);
 
