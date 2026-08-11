@@ -53,6 +53,11 @@ class AuthController extends Controller
 
     public function login(Request $request)
     {
+        // ===== DEBUG: LOG KONFIGURASI MAIL =====
+        \Log::info('📧 [MAIL] default: ' . config('mail.default'));
+        \Log::info('📧 [MAIL] smtp url: ' . config('mail.mailers.smtp.url'));
+        \Log::info('📧 [MAIL] MAIL_DSN from env: ' . env('MAIL_DSN'));
+
         $username = $request->input('username');
         $password = $request->input('password');
         $captchaId = $request->input('captcha_id');
@@ -103,11 +108,27 @@ class AuthController extends Controller
             $otp = $this->resolveOtpForUser($user);
             Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
 
+            // ---- TAMBAHAN LOG UNTUK DEBUG ----
+            \Log::info('🔐 [OTP] Akan mengirim OTP ke: ' . $user->email);
+            \Log::info('🔢 [OTP] Kode OTP: ' . $otp);
+            \Log::info('👤 [OTP] Username: ' . $user->username);
+
+            // ===== PENGIRIMAN OTP (DUA OPSI) =====
+            // OPSI A: Menggunakan OtpMail (seharusnya berhasil, tapi kadang bermasalah)
             try {
                 Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
+                \Log::info('✅ [OTP] OtpMail berhasil dikirim ke ' . $user->email);
             } catch (\Throwable $e) {
-                \Log::error("Failed to send OTP email to {$user->email}: " . $e->getMessage());
-                report($e);
+                \Log::error('❌ [OTP] OtpMail gagal: ' . $e->getMessage());
+                // OPSI B: Fallback ke Mail::raw jika OtpMail gagal
+                try {
+                    Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($user) {
+                        $message->to($user->email)->subject('Kode OTP Anda');
+                    });
+                    \Log::info('✅ [OTP] Mail::raw (fallback) berhasil dikirim ke ' . $user->email);
+                } catch (\Throwable $e2) {
+                    \Log::error('❌ [OTP] Mail::raw juga gagal: ' . $e2->getMessage());
+                }
             }
 
             $activeMinutes = (int) config('sso.session_active_minutes', 15);
@@ -485,17 +506,13 @@ class AuthController extends Controller
         return filled($user->email);
     }
 
+    /**
+     * Menghasilkan OTP acak 6 digit.
+     */
     private function resolveOtpForUser(User $user): string
     {
-        $otpMap = [
-            'admin_simrs' => '111111',
-            'dokter_amino' => '222222',
-            'petugas_lapor' => '333333',
-            'manager_wbs' => '444444',
-            'super_user' => '555555',
-        ];
-
-        return $otpMap[$user->username] ?? '123456';
+        // Generate OTP acak 6 digit (100000 - 999999)
+        return str_pad((string) random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
     }
 
     private function resolveUserFromCredentials(string $username, string $password): ?User
