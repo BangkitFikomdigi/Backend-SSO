@@ -109,6 +109,21 @@ class AuthController extends Controller
                 report($e);
             }
 
+            $activeMinutes = (int) config('sso.session_active_minutes', 15);
+            $refreshDays = (int) config('sso.refresh_token_days', 7);
+            $now = now();
+
+            $session = SsoSession::create([
+                'user_id' => $user->id,
+                'status' => 'pending',
+                'refresh_token' => $this->generateRefreshToken(),
+                'refresh_expires_at' => $now->copy()->addDays($refreshDays),
+                'expires_at' => $now->copy()->addMinutes($activeMinutes),
+                'activation_code' => null,
+                'captcha_id' => null,
+                'captcha_answer' => null,
+            ]);
+
             $this->logLoginActivity($user->id, $user->username, 'pending_otp', null, $request);
 
             return response()->json([
@@ -116,6 +131,7 @@ class AuthController extends Controller
                 'message' => 'OTP dikirim ke email Anda. Silakan verifikasi untuk melanjutkan login.',
                 'data' => [
                     'requires_otp' => true,
+                    'session_id' => $session->id,
                     'otp' => app()->environment(['local', 'testing']) ? $otp : null,
                     'user' => $this->userPayload($user),
                 ],
@@ -152,17 +168,33 @@ class AuthController extends Controller
 
     public function verifyOtp(Request $request)
     {
+        $sessionId = $request->input('session_id');
         $username = $request->input('username');
         $otp = $request->input('otp');
 
-        if (! $username || ! $otp) {
+        if (! $sessionId || ! $username || ! $otp) {
             return response()->json([
                 'success' => false,
-                'message' => 'Username dan OTP wajib diisi',
+                'message' => 'Session ID, username, dan OTP wajib diisi',
             ], 400);
         }
 
-        $user = User::where('username', $username)->first();
+        $session = SsoSession::find($sessionId);
+        if (! $session) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Session tidak ditemukan',
+            ], 404);
+        }
+
+        if ($session->status !== 'pending') {
+            return response()->json([
+                'success' => false,
+                'message' => "Session sudah berstatus {$session->status}",
+            ], 400);
+        }
+
+        $user = User::find($session->user_id);
         if (! $user) {
             return response()->json([
                 'success' => false,
@@ -191,8 +223,7 @@ class AuthController extends Controller
         $refreshDays = (int) config('sso.refresh_token_days', 7);
         $now = now();
 
-        $session = SsoSession::create([
-            'user_id' => $user->id,
+        $session->update([
             'status' => 'active',
             'refresh_token' => $this->generateRefreshToken(),
             'refresh_expires_at' => $now->copy()->addDays($refreshDays),
