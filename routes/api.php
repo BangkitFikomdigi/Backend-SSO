@@ -41,4 +41,6 @@ Route::prefix('api/auth')->group(function () {
     Route::delete('/logout', [AuthController::class, 'logout']);
 });
 
+Route::post('/login', [AuthController::class, 'login']);
+
 Route::get('/admin/login-activities', [AdminController::class, 'loginActivities']);
