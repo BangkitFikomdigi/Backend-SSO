@@ -106,6 +106,7 @@ class AuthController extends Controller
             try {
                 Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
             } catch (\Throwable $e) {
+                \Log::error("Failed to send OTP email to {$user->email}: " . $e->getMessage());
                 report($e);
             }
 
@@ -200,6 +201,13 @@ class AuthController extends Controller
                 'success' => false,
                 'message' => 'Pengguna tidak ditemukan',
             ], 404);
+        }
+
+        if ($user->username !== $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username tidak sesuai dengan session',
+            ], 400);
         }
 
         $expectedOtp = Cache::get("otp:{$user->username}");
