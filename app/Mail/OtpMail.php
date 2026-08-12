@@ -29,23 +29,14 @@ class OtpMail extends Mailable implements ShouldQueue
 
     public function content(): Content
     {
-        // Jika view tersedia, gunakan view
-        if (view()->exists('emails.otp')) {
-            return new Content(
-                view: 'emails.otp',
-                with: [
-                    'otp' => $this->otp,
-                    'username' => $this->username,
-                    'expiresIn' => $this->expiresIn,
-                ],
-            );
-        }
-
-        // Fallback ke plain text
-        $plainText = "Halo {$this->username},\n\nKode OTP Anda adalah: {$this->otp}\n\nKode ini berlaku selama {$this->expiresIn} menit.";
+        // PASTIKAN view ini ada
         return new Content(
-            htmlString: nl2br($plainText),
-            text: $plainText,
+            view: 'emails.otp',
+            with: [
+                'otp' => $this->otp,
+                'username' => $this->username,
+                'expiresIn' => $this->expiresIn,
+            ],
         );
     }
 
