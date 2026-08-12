@@ -275,6 +275,84 @@ class AuthController extends Controller
     }
 
     /**
+     * Kirim ulang kode OTP untuk session pending.
+     */
+    public function resendOtp(Request $request)
+    {
+        $sessionId = $request->input('session_id');
+        $username = $request->input('username');
+
+        if (! $sessionId || ! $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Session ID dan username wajib diisi',
+            ], 400);
+        }
+
+        // Cari session
+        $session = SsoSession::find($sessionId);
+        if (! $session) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Session tidak ditemukan',
+            ], 404);
+        }
+
+        // Pastikan session masih pending
+        if ($session->status !== 'pending') {
+            return response()->json([
+                'success' => false,
+                'message' => "Session sudah berstatus {$session->status}, tidak dapat mengirim ulang OTP",
+            ], 400);
+        }
+
+        // Cari user
+        $user = User::find($session->user_id);
+        if (! $user || $user->username !== $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username tidak sesuai dengan session',
+            ], 400);
+        }
+
+        // Generate OTP baru
+        $otp = $this->resolveOtpForUser($user);
+
+        // Simpan OTP di cache (5 menit)
+        Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
+
+        // Kirim email OTP baru dengan fallback
+        try {
+            Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
+            \Log::info('✅ [RESEND OTP] OtpMail berhasil dikirim ke ' . $user->email);
+        } catch (\Throwable $e) {
+            \Log::error('❌ [RESEND OTP] OtpMail gagal: ' . $e->getMessage());
+            // Fallback ke Mail::raw jika OtpMail gagal
+            try {
+                Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($user) {
+                    $message->to($user->email)->subject('Kode OTP Anda');
+                });
+                \Log::info('✅ [RESEND OTP] Mail::raw (fallback) berhasil dikirim ke ' . $user->email);
+            } catch (\Throwable $e2) {
+                \Log::error('❌ [RESEND OTP] Fallback Mail::raw juga gagal: ' . $e2->getMessage());
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Gagal mengirim ulang OTP. Silakan coba lagi.',
+                ], 500);
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kode OTP baru telah dikirim ke email Anda.',
+            'data' => [
+                'session_id' => $session->id,
+                'otp' => app()->environment(['local', 'testing']) ? $otp : null,
+            ],
+        ], 200);
+    }
+
+    /**
      * Endpoint aktivasi sesi 'pending' (kode aktivasi + captcha tersimpan di
      * baris session). Dipertahankan untuk kompatibilitas, meski alur login
      * saat ini langsung membuat sesi 'active' tanpa tahap pending.
