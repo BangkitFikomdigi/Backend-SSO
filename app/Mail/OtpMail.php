@@ -29,7 +29,6 @@ class OtpMail extends Mailable implements ShouldQueue
 
     public function content(): Content
     {
-        // PASTIKAN view ini ada
         return new Content(
             view: 'emails.otp',
             with: [
