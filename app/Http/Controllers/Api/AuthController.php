@@ -622,9 +622,23 @@ class AuthController extends Controller
 
     private function shouldRequireOtp(User $user): bool
     {
-        // OTP wajib untuk setiap login baru, tanpa kecuali - jangan
-        // digantungkan ke field lain (mis. email) yang bisa saja kosong.
-        return true;
+        // OTP dilewati HANYA kalau user ini masih punya sesi yang "diingat":
+        // refresh_token belum di-null-kan (belum pernah pencet Logout) DAN
+        // belum melewati masa berlaku refresh_expires_at (7 hari).
+        //
+        // - Idle timeout (expires_at 15 menit lewat) TIDAK menghapus
+        //   refresh_token -> sesi tetap dianggap "diingat" -> login ulang
+        //   tanpa OTP.
+        // - Logout eksplisit MENGHAPUS refresh_token (lihat logout()) ->
+        //   tidak ada sesi yang cocok -> wajib OTP lagi.
+        // - First-time login (belum pernah ada sesi sama sekali) -> tidak
+        //   ada sesi yang cocok -> wajib OTP.
+        $hasRememberedSession = SsoSession::where('user_id', $user->id)
+            ->whereNotNull('refresh_token')
+            ->where('refresh_expires_at', '>', now())
+            ->exists();
+
+        return ! $hasRememberedSession;
     }
 
     /**
