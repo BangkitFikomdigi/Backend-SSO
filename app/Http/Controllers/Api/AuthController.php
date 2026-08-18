@@ -53,10 +53,11 @@ class AuthController extends Controller
 
     public function login(Request $request)
     {
-        // ===== DEBUG: LOG KONFIGURASI MAIL =====
-        \Log::info('📧 [MAIL] default: ' . config('mail.default'));
-        \Log::info('📧 [MAIL] smtp url: ' . config('mail.mailers.smtp.url'));
-        \Log::info('📧 [MAIL] MAIL_DSN from env: ' . env('MAIL_DSN'));
+        // ===== DEBUG: LOG KONFIGURASI MAIL (hanya di environment local) =====
+        if (app()->environment('local')) {
+            \Log::info('📧 [MAIL] default: ' . config('mail.default'));
+            \Log::info('📧 [MAIL] smtp url: ' . config('mail.mailers.smtp.url'));
+        }
 
         $username = $request->input('username');
         $password = $request->input('password');
@@ -108,10 +109,12 @@ class AuthController extends Controller
             $otp = $this->resolveOtpForUser($user);
             Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
 
-            // ---- TAMBAHAN LOG UNTUK DEBUG ----
-            \Log::info('🔐 [OTP] Akan mengirim OTP ke: ' . $user->email);
-            \Log::info('🔢 [OTP] Kode OTP: ' . $otp);
-            \Log::info('👤 [OTP] Username: ' . $user->username);
+            // Catatan: kode OTP asli SENGAJA tidak pernah ditulis ke log,
+            // walau di environment local - supaya log server tidak jadi
+            // celah untuk login tanpa akses email.
+            if (app()->environment('local')) {
+                \Log::info('🔐 [OTP] Mengirim OTP ke user: ' . $user->username);
+            }
 
             // ===== PENGIRIMAN OTP (DUA OPSI) =====
             // OPSI A: Menggunakan OtpMail (seharusnya berhasil, tapi kadang bermasalah)
@@ -231,6 +234,18 @@ class AuthController extends Controller
             ], 400);
         }
 
+        $maxOtpAttempts = (int) config('sso.max_otp_attempts', 5);
+
+        if ($session->activation_attempts >= $maxOtpAttempts) {
+            $session->update(['status' => 'expired']);
+            Cache::forget("otp:{$user->username}");
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Terlalu banyak percobaan OTP salah. Silakan login ulang.',
+            ], 429);
+        }
+
         $expectedOtp = Cache::get("otp:{$user->username}");
         if ($expectedOtp === null) {
             return response()->json([
@@ -240,9 +255,13 @@ class AuthController extends Controller
         }
 
         if ((string) $otp !== (string) $expectedOtp) {
+            $newAttempts = (int) $session->activation_attempts + 1;
+            $session->update(['activation_attempts' => $newAttempts]);
+
             return response()->json([
                 'success' => false,
                 'message' => 'OTP tidak sesuai',
+                'remaining_attempts' => max(0, $maxOtpAttempts - $newAttempts),
             ], 400);
         }
 
@@ -254,6 +273,7 @@ class AuthController extends Controller
 
         $session->update([
             'status' => 'active',
+            'activation_attempts' => 0,
             'refresh_token' => $this->generateRefreshToken(),
             'refresh_expires_at' => $now->copy()->addDays($refreshDays),
             'expires_at' => $now->copy()->addMinutes($activeMinutes),
@@ -272,6 +292,88 @@ class AuthController extends Controller
                 'user' => $this->userPayload($user),
             ],
         ], 201);
+    }
+
+    /**
+     * Kirim ulang kode OTP untuk sesi 'pending' yang sama (dipanggil dari
+     * tombol "Kirim ulang kode OTP" di halaman login).
+     */
+    public function resendOtp(Request $request)
+    {
+        $sessionId = $request->input('session_id');
+        $username = $request->input('username');
+
+        if (! $sessionId || ! $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Session ID dan username wajib diisi',
+            ], 400);
+        }
+
+        $session = SsoSession::find($sessionId);
+        if (! $session) {
+            return response()->json(['success' => false, 'message' => 'Session tidak ditemukan'], 404);
+        }
+
+        if ($session->status !== 'pending') {
+            return response()->json([
+                'success' => false,
+                'message' => "Session sudah berstatus {$session->status}. Silakan login ulang.",
+            ], 400);
+        }
+
+        $user = User::find($session->user_id);
+        if (! $user || $user->username !== $username) {
+            return response()->json(['success' => false, 'message' => 'Username tidak sesuai dengan session'], 400);
+        }
+
+        // Batasi frekuensi kirim ulang di sisi server (jangan cuma andalkan cooldown di frontend).
+        $cooldownSeconds = (int) config('sso.otp_resend_cooldown_seconds', 30);
+        $cooldownKey = "otp_resend_cooldown:{$session->id}";
+
+        if (Cache::has($cooldownKey)) {
+            $retryAfter = Cache::get($cooldownKey) - now()->timestamp;
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Mohon tunggu sebelum meminta kode OTP baru.',
+                'retry_after' => max(1, $retryAfter),
+            ], 429);
+        }
+
+        $otp = $this->resolveOtpForUser($user);
+        Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
+        Cache::put($cooldownKey, now()->addSeconds($cooldownSeconds)->timestamp, now()->addSeconds($cooldownSeconds));
+
+        // Reset counter percobaan gagal setiap kali kode baru dikirim.
+        $session->update(['activation_attempts' => 0]);
+
+        try {
+            Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
+        } catch (\Throwable $e) {
+            \Log::error('❌ [OTP] Gagal mengirim ulang OTP: ' . $e->getMessage());
+            try {
+                Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($user) {
+                    $message->to($user->email)->subject('Kode OTP Anda');
+                });
+            } catch (\Throwable $e2) {
+                \Log::error('❌ [OTP] Mail::raw fallback juga gagal: ' . $e2->getMessage());
+
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Gagal mengirim ulang OTP. Silakan coba beberapa saat lagi.',
+                ], 500);
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kode OTP baru telah dikirim ke email Anda.',
+            'data' => [
+                'session_id' => $session->id,
+                'otp' => app()->environment(['local', 'testing']) ? $otp : null,
+            ],
+        ]);
     }
 
     /**
@@ -472,14 +574,31 @@ class AuthController extends Controller
     public function logout(Request $request)
     {
         $sessionId = $request->input('session_id');
-        if (! $sessionId) {
-            return response()->json(['success' => false, 'message' => 'session_id wajib diisi'], 400);
+
+        $query = SsoSession::query();
+
+        if ($sessionId) {
+            $query->where('id', $sessionId);
+        } else {
+            // Fallback: frontend biasanya cuma menyimpan token, bukan session_id.
+            $authHeader = $request->header('Authorization', '');
+            $token = Str::startsWith($authHeader, 'Bearer ')
+                ? substr($authHeader, 7)
+                : ($request->input('token') ?: null);
+
+            if (! $token) {
+                return response()->json(['success' => false, 'message' => 'session_id atau token wajib diisi'], 400);
+            }
+
+            $query->where('refresh_token', $token);
         }
 
-        $updated = SsoSession::where('id', $sessionId)->update(['status' => 'expired', 'refresh_token' => null]);
+        $updated = $query->update(['status' => 'expired', 'refresh_token' => null]);
 
         if ($updated === 0) {
-            return response()->json(['success' => false, 'message' => 'Session tidak ditemukan'], 404);
+            // Tetap dianggap sukses: kalaupun session sudah tidak ada/expired,
+            // hasil akhir yang diinginkan (client tidak lagi punya sesi aktif) tercapai.
+            return response()->json(['success' => true, 'message' => 'Session sudah tidak aktif.']);
         }
 
         return response()->json(['success' => true, 'message' => 'Logout berhasil. Session dan token dinonaktifkan.']);
@@ -503,7 +622,9 @@ class AuthController extends Controller
 
     private function shouldRequireOtp(User $user): bool
     {
-        return filled($user->email);
+        // OTP wajib untuk setiap login baru, tanpa kecuali - jangan
+        // digantungkan ke field lain (mis. email) yang bisa saja kosong.
+        return true;
     }
 
     /**

@@ -22,6 +22,7 @@ Route::prefix('auth')->group(function () {
     Route::post('/captcha', [AuthController::class, 'captcha']);
     Route::post('/login', [AuthController::class, 'login']);
     Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
+    Route::post('/resend-otp', [AuthController::class, 'resendOtp']);
     Route::post('/activate', [AuthController::class, 'activate']);
     Route::post('/session', [AuthController::class, 'session']);
     Route::post('/validate', [AuthController::class, 'validateToken']);
@@ -34,6 +35,7 @@ Route::prefix('api/auth')->group(function () {
     Route::post('/captcha', [AuthController::class, 'captcha']);
     Route::post('/login', [AuthController::class, 'login']);
     Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
+    Route::post('/resend-otp', [AuthController::class, 'resendOtp']);
     Route::post('/activate', [AuthController::class, 'activate']);
     Route::post('/session', [AuthController::class, 'session']);
     Route::post('/validate', [AuthController::class, 'validateToken']);
