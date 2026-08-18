@@ -295,8 +295,12 @@ class AuthController extends Controller
     }
 
     /**
+<<<<<<< HEAD
      * Kirim ulang kode OTP untuk sesi 'pending' yang sama (dipanggil dari
      * tombol "Kirim ulang kode OTP" di halaman login).
+=======
+     * Kirim ulang kode OTP untuk session pending.
+>>>>>>> 78821d14e2cffa0c34e8d1213876effc03b60a1d
      */
     public function resendOtp(Request $request)
     {
@@ -310,6 +314,7 @@ class AuthController extends Controller
             ], 400);
         }
 
+<<<<<<< HEAD
         $session = SsoSession::find($sessionId);
         if (! $session) {
             return response()->json(['success' => false, 'message' => 'Session tidak ditemukan'], 404);
@@ -352,16 +357,66 @@ class AuthController extends Controller
             Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
         } catch (\Throwable $e) {
             \Log::error('❌ [OTP] Gagal mengirim ulang OTP: ' . $e->getMessage());
+=======
+        // Cari session
+        $session = SsoSession::find($sessionId);
+        if (! $session) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Session tidak ditemukan',
+            ], 404);
+        }
+
+        // Pastikan session masih pending
+        if ($session->status !== 'pending') {
+            return response()->json([
+                'success' => false,
+                'message' => "Session sudah berstatus {$session->status}, tidak dapat mengirim ulang OTP",
+            ], 400);
+        }
+
+        // Cari user
+        $user = User::find($session->user_id);
+        if (! $user || $user->username !== $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username tidak sesuai dengan session',
+            ], 400);
+        }
+
+        // Generate OTP baru
+        $otp = $this->resolveOtpForUser($user);
+
+        // Simpan OTP di cache (5 menit)
+        Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
+
+        // Kirim email OTP baru dengan fallback
+        try {
+            Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
+            \Log::info('✅ [RESEND OTP] OtpMail berhasil dikirim ke ' . $user->email);
+        } catch (\Throwable $e) {
+            \Log::error('❌ [RESEND OTP] OtpMail gagal: ' . $e->getMessage());
+            // Fallback ke Mail::raw jika OtpMail gagal
+>>>>>>> 78821d14e2cffa0c34e8d1213876effc03b60a1d
             try {
                 Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($user) {
                     $message->to($user->email)->subject('Kode OTP Anda');
                 });
+<<<<<<< HEAD
             } catch (\Throwable $e2) {
                 \Log::error('❌ [OTP] Mail::raw fallback juga gagal: ' . $e2->getMessage());
 
                 return response()->json([
                     'success' => false,
                     'message' => 'Gagal mengirim ulang OTP. Silakan coba beberapa saat lagi.',
+=======
+                \Log::info('✅ [RESEND OTP] Mail::raw (fallback) berhasil dikirim ke ' . $user->email);
+            } catch (\Throwable $e2) {
+                \Log::error('❌ [RESEND OTP] Fallback Mail::raw juga gagal: ' . $e2->getMessage());
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Gagal mengirim ulang OTP. Silakan coba lagi.',
+>>>>>>> 78821d14e2cffa0c34e8d1213876effc03b60a1d
                 ], 500);
             }
         }
@@ -373,7 +428,11 @@ class AuthController extends Controller
                 'session_id' => $session->id,
                 'otp' => app()->environment(['local', 'testing']) ? $otp : null,
             ],
+<<<<<<< HEAD
         ]);
+=======
+        ], 200);
+>>>>>>> 78821d14e2cffa0c34e8d1213876effc03b60a1d
     }
 
     /**
