@@ -106,6 +106,9 @@ class AuthController extends Controller
         }
 
         if ($this->shouldRequireOtp($user)) {
+            // Hapus OTP lama jika ada (untuk memastikan OTP baru selalu dikirim)
+            Cache::forget("otp:{$user->username}");
+            
             $otp = $this->resolveOtpForUser($user);
             Cache::put("otp:{$user->username}", $otp, now()->addMinutes(5));
 
@@ -574,10 +577,15 @@ class AuthController extends Controller
     public function logout(Request $request)
     {
         $sessionId = $request->input('session_id');
+        $username = $request->input('username');
 
         $query = SsoSession::query();
 
         if ($sessionId) {
+            $session = SsoSession::find($sessionId);
+            if ($session) {
+                $username = User::find($session->user_id)?->username;
+            }
             $query->where('id', $sessionId);
         } else {
             // Fallback: frontend biasanya cuma menyimpan token, bukan session_id.
@@ -590,14 +598,32 @@ class AuthController extends Controller
                 return response()->json(['success' => false, 'message' => 'session_id atau token wajib diisi'], 400);
             }
 
+            $session = SsoSession::where('refresh_token', $token)->first();
+            if ($session) {
+                $username = User::find($session->user_id)?->username;
+            }
             $query->where('refresh_token', $token);
         }
 
+        // Jika username ditemukan, revoke SEMUA session milik user tersebut
+        if ($username) {
+            $user = User::where('username', $username)->first();
+            if ($user) {
+                SsoSession::where('user_id', $user->id)
+                    ->where('status', 'active')
+                    ->update(['status' => 'expired', 'refresh_token' => null]);
+
+                // Hapus OTP yang mungkin masih tersimpan di cache
+                Cache::forget("otp:{$username}");
+
+                return response()->json(['success' => true, 'message' => 'Logout berhasil. Semua sesi user dinonaktifkan.']);
+            }
+        }
+
+        // Jika tidak ada username, tetap revoke session yang ditemukan
         $updated = $query->update(['status' => 'expired', 'refresh_token' => null]);
 
         if ($updated === 0) {
-            // Tetap dianggap sukses: kalaupun session sudah tidak ada/expired,
-            // hasil akhir yang diinginkan (client tidak lagi punya sesi aktif) tercapai.
             return response()->json(['success' => true, 'message' => 'Session sudah tidak aktif.']);
         }
 
@@ -622,23 +648,8 @@ class AuthController extends Controller
 
     private function shouldRequireOtp(User $user): bool
     {
-        // OTP dilewati HANYA kalau user ini masih punya sesi yang "diingat":
-        // refresh_token belum di-null-kan (belum pernah pencet Logout) DAN
-        // belum melewati masa berlaku refresh_expires_at (7 hari).
-        //
-        // - Idle timeout (expires_at 15 menit lewat) TIDAK menghapus
-        //   refresh_token -> sesi tetap dianggap "diingat" -> login ulang
-        //   tanpa OTP.
-        // - Logout eksplisit MENGHAPUS refresh_token (lihat logout()) ->
-        //   tidak ada sesi yang cocok -> wajib OTP lagi.
-        // - First-time login (belum pernah ada sesi sama sekali) -> tidak
-        //   ada sesi yang cocok -> wajib OTP.
-        $hasRememberedSession = SsoSession::where('user_id', $user->id)
-            ->whereNotNull('refresh_token')
-            ->where('refresh_expires_at', '>', now())
-            ->exists();
-
-        return ! $hasRememberedSession;
+        // Selalu meminta OTP setiap kali login
+        return true;
     }
 
     /**
