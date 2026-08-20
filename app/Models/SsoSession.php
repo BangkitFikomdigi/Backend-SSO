@@ -30,11 +30,13 @@ class SsoSession extends Model
         'refresh_token',
         'refresh_expires_at',
         'expires_at',
+        'last_activity_at',
     ];
 
     protected $casts = [
         'refresh_expires_at' => 'datetime',
         'expires_at' => 'datetime',
+        'last_activity_at' => 'datetime',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];

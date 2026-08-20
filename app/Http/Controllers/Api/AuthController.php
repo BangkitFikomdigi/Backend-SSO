@@ -8,6 +8,7 @@ use App\Models\LoginActivity;
 use App\Models\SsoSession;
 use App\Models\User;
 use App\Support\CaptchaGenerator;
+use App\Support\JwtToken;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -137,16 +138,14 @@ class AuthController extends Controller
                 }
             }
 
-            $activeMinutes = (int) config('sso.session_active_minutes', 15);
-            $refreshDays = (int) config('sso.refresh_token_days', 7);
-            $now = now();
+            // Sesi 'pending' belum dapat access_token/refresh_token - token baru
+            // diterbitkan setelah OTP terverifikasi (lihat verifyOtp()).
+            $pendingMinutes = (int) config('sso.session_pending_minutes', 5);
 
             $session = SsoSession::create([
                 'user_id' => $user->id,
                 'status' => 'pending',
-                'refresh_token' => $this->generateRefreshToken(),
-                'refresh_expires_at' => $now->copy()->addDays($refreshDays),
-                'expires_at' => $now->copy()->addMinutes($activeMinutes),
+                'expires_at' => now()->addMinutes($pendingMinutes),
                 'activation_code' => null,
                 'captcha_id' => null,
                 'captcha_answer' => null,
@@ -167,30 +166,27 @@ class AuthController extends Controller
         }
 
         // 3. Semua valid -> langsung buat sesi aktif (tanpa tahap aktivasi terpisah).
-        $activeMinutes = (int) config('sso.session_active_minutes', 15);
-        $refreshDays = (int) config('sso.refresh_token_days', 7);
         $now = now();
 
         $session = SsoSession::create([
             'user_id' => $user->id,
             'status' => 'active',
-            'refresh_token' => $this->generateRefreshToken(),
-            'refresh_expires_at' => $now->copy()->addDays($refreshDays),
-            'expires_at' => $now->copy()->addMinutes($activeMinutes),
+            'expires_at' => $now->copy()->addMinutes((int) config('sso.session_active_minutes', 30)),
+            'last_activity_at' => $now,
         ]);
+
+        $tokens = $this->issueTokens($session, $user);
 
         $this->logLoginActivity($user->id, $user->username, 'success', null, $request);
 
         return response()->json([
             'success' => true,
-            'data' => [
-                'refresh_token' => $session->refresh_token,
-                'expires_in' => $activeMinutes * 60,
+            'data' => array_merge([
                 'session_id' => $session->id,
                 'status' => 'active',
                 'requires_otp' => false,
                 'user' => $this->userPayload($user),
-            ],
+            ], $tokens),
         ], 201);
     }
 
@@ -270,30 +266,25 @@ class AuthController extends Controller
 
         Cache::forget("otp:{$user->username}");
 
-        $activeMinutes = (int) config('sso.session_active_minutes', 15);
-        $refreshDays = (int) config('sso.refresh_token_days', 7);
-        $now = now();
-
         $session->update([
             'status' => 'active',
             'activation_attempts' => 0,
-            'refresh_token' => $this->generateRefreshToken(),
-            'refresh_expires_at' => $now->copy()->addDays($refreshDays),
-            'expires_at' => $now->copy()->addMinutes($activeMinutes),
+            'expires_at' => now()->addMinutes((int) config('sso.session_active_minutes', 30)),
+            'last_activity_at' => now(),
         ]);
+
+        $tokens = $this->issueTokens($session, $user);
 
         $this->logLoginActivity($user->id, $user->username, 'success', 'otp_verified', $request);
 
         return response()->json([
             'success' => true,
-            'data' => [
-                'refresh_token' => $session->refresh_token,
-                'expires_in' => $activeMinutes * 60,
+            'data' => array_merge([
                 'session_id' => $session->id,
                 'status' => 'active',
                 'requires_otp' => false,
                 'user' => $this->userPayload($user),
-            ],
+            ], $tokens),
         ], 201);
     }
 
@@ -436,34 +427,38 @@ class AuthController extends Controller
             ], 400);
         }
 
-        $activeMinutes = (int) config('sso.session_active_minutes', 15);
-        $refreshDays = (int) config('sso.refresh_token_days', 7);
-        $now = now();
-
         $session->update([
             'status' => 'active',
             'activation_code' => null,
             'captcha_id' => null,
             'captcha_answer' => null,
-            'refresh_token' => $this->generateRefreshToken(),
-            'refresh_expires_at' => $now->copy()->addDays($refreshDays),
-            'expires_at' => $now->copy()->addMinutes($activeMinutes),
+            'expires_at' => now()->addMinutes((int) config('sso.session_active_minutes', 30)),
+            'last_activity_at' => now(),
         ]);
 
         $user = User::find($session->user_id);
+        $tokens = $this->issueTokens($session, $user);
 
         return response()->json([
             'success' => true,
-            'data' => [
-                'refresh_token' => $session->refresh_token,
-                'expires_in' => $activeMinutes * 60,
+            'data' => array_merge([
                 'session_id' => $session->id,
                 'status' => 'active',
                 'user' => $this->userPayload($user),
-            ],
+            ], $tokens),
         ]);
     }
 
+    /**
+     * Dipakai untuk 2 hal:
+     * 1. Cek status sesi saat ini (dipanggil tanpa Authorization header).
+     * 2. Tombol "Lanjutkan" setelah sesi jadi 'inactive' karena idle 30 menit:
+     *    kirim access_token yang masih dimiliki user via Authorization: Bearer
+     *    -> jika token itu masih valid (belum lewat 1 hari), sesi langsung
+     *    diaktifkan lagi TANPA login ulang / OTP. Tidak ada token baru yang
+     *    diterbitkan di sini karena access_token & refresh_token yang lama
+     *    memang belum kadaluarsa.
+     */
     public function session(Request $request)
     {
         $sessionId = $request->input('session_id');
@@ -476,8 +471,28 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'Session tidak ditemukan'], 404);
         }
 
-        if ($session->status === 'active' && $session->expires_at && now()->greaterThan($session->expires_at)) {
-            $session->update(['status' => 'expired']);
+        // Sesi 'active' yang idle-nya sudah lewat 30 menit -> turunkan jadi
+        // 'inactive' (bukan 'expired'): token JWT-nya sendiri masih berlaku.
+        $this->demoteIfIdle($session);
+
+        if ($session->status === 'inactive') {
+            $accessToken = $this->bearerToken($request) ?? $request->input('access_token');
+
+            if ($accessToken) {
+                $payload = JwtToken::decode($accessToken);
+                $tokenMatchesSession = $payload
+                    && ($payload['type'] ?? null) === 'access'
+                    && (string) ($payload['session_id'] ?? null) === (string) $session->id;
+
+                if ($tokenMatchesSession) {
+                    $activeMinutes = (int) config('sso.session_active_minutes', 30);
+                    $session->update([
+                        'status' => 'active',
+                        'last_activity_at' => now(),
+                        'expires_at' => now()->addMinutes($activeMinutes),
+                    ]);
+                }
+            }
         }
 
         $user = User::find($session->user_id);
@@ -489,6 +504,7 @@ class AuthController extends Controller
                 'status' => $session->status,
                 'user' => $this->userPayload($user),
                 'created_at' => optional($session->created_at)->toJSON(),
+                'last_activity_at' => optional($session->last_activity_at)->toJSON(),
                 'expires_at' => optional($session->expires_at)->toJSON(),
                 'expires_in' => $session->expires_at
                     ? $this->minutesRemaining($session->expires_at)
@@ -497,6 +513,13 @@ class AuthController extends Controller
         ]);
     }
 
+    /**
+     * Validasi access_token (JWT, dikirim via Authorization: Bearer) untuk
+     * otorisasi API. Berhasil di sini = dianggap "aktivitas user", jadi
+     * jendela inactivity-timeout 30 menit pada layer session ikut di-reset
+     * (sliding window), terpisah dari masa berlaku access_token itu sendiri
+     * (fixed 1 hari, tidak diperpanjang di sini).
+     */
     public function validateToken(Request $request)
     {
         $authHeader = $request->header('Authorization', '');
@@ -512,16 +535,42 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'valid' => false, 'message' => 'Token tidak ditemukan'], 401);
         }
 
-        $session = SsoSession::where('refresh_token', $token)->where('status', 'active')->first();
+        $payload = JwtToken::decode($token);
+        if (! $payload || ($payload['type'] ?? null) !== 'access' || empty($payload['session_id'])) {
+            return response()->json(['success' => false, 'valid' => false, 'message' => 'Access token tidak valid atau kadaluarsa'], 401);
+        }
+
+        // 'active' DAN 'inactive' sengaja sama-sama dicari di sini supaya kita
+        // bisa membedakan pesan errornya: sesi idle (inactive, token masih
+        // hidup) vs sesi yang sudah benar-benar mati (logout / expired).
+        $session = SsoSession::where('id', $payload['session_id'])
+            ->whereIn('status', ['active', 'inactive'])
+            ->first();
+
         if (! $session) {
-            return response()->json(['success' => false, 'valid' => false, 'message' => 'Token tidak valid atau session tidak aktif'], 401);
+            return response()->json(['success' => false, 'valid' => false, 'message' => 'Session tidak ditemukan. Silakan login ulang.'], 401);
         }
 
-        if ($session->expires_at && now()->greaterThan($session->expires_at)) {
-            $session->update(['status' => 'expired']);
-
-            return response()->json(['success' => false, 'valid' => false, 'message' => 'Session expired'], 401);
+        if ($session->status === 'inactive' || $this->demoteIfIdle($session)) {
+            return response()->json([
+                'success' => false,
+                'valid' => false,
+                'message' => 'Session tidak aktif karena tidak ada aktivitas selama 30 menit. Klik "Lanjutkan" untuk melanjutkan tanpa login ulang.',
+                'data' => [
+                    'session_id' => $session->id,
+                    'session_status' => 'inactive',
+                ],
+            ], 401);
         }
+
+        // Session masih 'active': request ini terhitung aktivitas -> geser
+        // jendela inactivity 30 menit (last_activity_at), terpisah dari masa
+        // berlaku access_token itu sendiri (fixed 1 hari, tidak diperpanjang di sini).
+        $activeMinutes = (int) config('sso.session_active_minutes', 30);
+        $session->update([
+            'last_activity_at' => now(),
+            'expires_at' => now()->addMinutes($activeMinutes),
+        ]);
 
         $user = User::find($session->user_id);
 
@@ -536,6 +585,12 @@ class AuthController extends Controller
         ]);
     }
 
+    /**
+     * Tukar refresh_token (masih berlaku, s.d. 7 hari) dengan access_token
+     * baru. refresh_token TIDAK dirotasi di sini - tetap sama sampai
+     * kadaluarsa sendiri atau logout, supaya frontend tidak perlu menyimpan
+     * ulang refresh_token tiap kali refresh access_token.
+     */
     public function refresh(Request $request)
     {
         $refreshToken = $request->input('refresh_token');
@@ -543,7 +598,14 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'refresh_token wajib diisi'], 400);
         }
 
-        $session = SsoSession::where('refresh_token', $refreshToken)->first();
+        $payload = JwtToken::decode($refreshToken);
+        if (! $payload || ($payload['type'] ?? null) !== 'refresh' || empty($payload['session_id'])) {
+            return response()->json(['success' => false, 'message' => 'Refresh token tidak valid atau kadaluarsa'], 401);
+        }
+
+        $session = SsoSession::where('id', $payload['session_id'])
+            ->where('refresh_token', $refreshToken)
+            ->first();
         if (! $session) {
             return response()->json(['success' => false, 'message' => 'Refresh token tidak valid'], 401);
         }
@@ -554,19 +616,30 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'Refresh token kadaluarsa. Silakan login ulang.'], 401);
         }
 
-        $activeMinutes = (int) config('sso.session_active_minutes', 15);
+        $activeMinutes = (int) config('sso.session_active_minutes', 30);
+        $accessMinutes = (int) config('sso.access_token_minutes', 1440);
+
         $session->update([
             'status' => 'active',
             'expires_at' => now()->addMinutes($activeMinutes),
+            'last_activity_at' => now(),
         ]);
 
         $user = User::find($session->user_id);
 
+        $accessToken = JwtToken::encode([
+            'sub' => $user->id,
+            'username' => $user->username,
+            'session_id' => $session->id,
+            'type' => 'access',
+        ], $accessMinutes * 60);
+
         return response()->json([
             'success' => true,
             'data' => [
+                'access_token' => $accessToken,
+                'expires_in' => $accessMinutes * 60,
                 'refresh_token' => $refreshToken,
-                'expires_in' => $activeMinutes * 60,
                 'session_id' => $session->id,
                 'status' => 'active',
                 'user' => $this->userPayload($user),
@@ -574,60 +647,88 @@ class AuthController extends Controller
         ]);
     }
 
+    /**
+     * Full revoke untuk SATU session (device/browser yang sedang logout),
+     * bukan semua session milik user. 3 hal langsung hilang bersamaan:
+     * - Session: baris-nya DIHAPUS dari server (bukan cuma ditandai expired).
+     * - Access token: otomatis jadi tidak valid, karena validateToken() &
+     *   session() selalu silang-cek session_id ke DB - begitu barisnya
+     *   hilang, token manapun yang menunjuk ke session itu langsung ditolak.
+     * - Refresh token: sama - refresh() mencocokkan token ke baris session
+     *   ini, jadi begitu baris dihapus, refresh_token lama otomatis tidak
+     *   bisa dipakai lagi ("blacklisted" secara efektif).
+     */
     public function logout(Request $request)
     {
         $sessionId = $request->input('session_id');
-        $username = $request->input('username');
+        $session = $sessionId ? SsoSession::find($sessionId) : null;
 
-        $query = SsoSession::query();
-
-        if ($sessionId) {
-            $session = SsoSession::find($sessionId);
-            if ($session) {
-                $username = User::find($session->user_id)?->username;
-            }
-            $query->where('id', $sessionId);
-        } else {
+        if (! $session) {
             // Fallback: frontend biasanya cuma menyimpan token, bukan session_id.
-            $authHeader = $request->header('Authorization', '');
-            $token = Str::startsWith($authHeader, 'Bearer ')
-                ? substr($authHeader, 7)
-                : ($request->input('token') ?: null);
+            // Authorization: Bearer di sini berisi access_token - decode untuk
+            // dapat session_id-nya (bukan dicocokkan langsung ke refresh_token).
+            $token = $this->bearerToken($request) ?? $request->input('token');
 
             if (! $token) {
                 return response()->json(['success' => false, 'message' => 'session_id atau token wajib diisi'], 400);
             }
 
-            $session = SsoSession::where('refresh_token', $token)->first();
-            if ($session) {
-                $username = User::find($session->user_id)?->username;
-            }
-            $query->where('refresh_token', $token);
+            $payload = JwtToken::decode($token);
+            $decodedSessionId = $payload['session_id'] ?? null;
+
+            $session = $decodedSessionId
+                ? SsoSession::find($decodedSessionId)
+                // Token tidak bisa didecode (mis. bukan JWT) - fallback lama:
+                // coba cocokkan sebagai refresh_token mentah.
+                : SsoSession::where('refresh_token', $token)->first();
         }
 
-        // Jika username ditemukan, revoke SEMUA session milik user tersebut
-        if ($username) {
-            $user = User::where('username', $username)->first();
-            if ($user) {
-                SsoSession::where('user_id', $user->id)
-                    ->where('status', 'active')
-                    ->update(['status' => 'expired', 'refresh_token' => null]);
-
-                // Hapus OTP yang mungkin masih tersimpan di cache
-                Cache::forget("otp:{$username}");
-
-                return response()->json(['success' => true, 'message' => 'Logout berhasil. Semua sesi user dinonaktifkan.']);
-            }
-        }
-
-        // Jika tidak ada username, tetap revoke session yang ditemukan
-        $updated = $query->update(['status' => 'expired', 'refresh_token' => null]);
-
-        if ($updated === 0) {
+        if (! $session) {
             return response()->json(['success' => true, 'message' => 'Session sudah tidak aktif.']);
         }
 
+        Cache::forget("otp_resend_cooldown:{$session->id}");
+
+        $session->delete();
+
         return response()->json(['success' => true, 'message' => 'Logout berhasil. Session dan token dinonaktifkan.']);
+    }
+
+    /**
+     * Jika sesi 'active' sudah idle lebih dari session_active_minutes (dihitung
+     * dari last_activity_at, fallback ke created_at kalau belum pernah diisi),
+     * turunkan statusnya jadi 'inactive' dan simpan. Return true kalau baru
+     * saja diturunkan (atau memang statusnya sudah 'inactive' sebelumnya).
+     */
+    private function demoteIfIdle(SsoSession $session): bool
+    {
+        if ($session->status === 'inactive') {
+            return true;
+        }
+
+        if ($session->status !== 'active') {
+            return false;
+        }
+
+        $activeMinutes = (int) config('sso.session_active_minutes', 30);
+        $lastActivity = $session->last_activity_at ?? $session->created_at ?? now();
+
+        if (now()->greaterThan($lastActivity->copy()->addMinutes($activeMinutes))) {
+            $session->update(['status' => 'inactive']);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private function bearerToken(Request $request): ?string
+    {
+        $authHeader = $request->header('Authorization', '');
+
+        return Str::startsWith($authHeader, 'Bearer ')
+            ? substr($authHeader, 7)
+            : null;
     }
 
     private function userPayload(?User $user): array
@@ -689,9 +790,41 @@ class AuthController extends Controller
         );
     }
 
-    private function generateRefreshToken(): string
+    /**
+     * Terbitkan access_token (JWT, 1 hari) + refresh_token (JWT, 7 hari)
+     * untuk sebuah sesi 'active', dan simpan refresh_token-nya ke DB supaya
+     * bisa dicabut (revoke) saat logout - meski formatnya JWT stateless,
+     * validasi refresh tetap silang-cek ke session di DB untuk itu.
+     */
+    private function issueTokens(SsoSession $session, User $user): array
     {
-        return bin2hex(random_bytes(64));
+        $accessMinutes = (int) config('sso.access_token_minutes', 1440);
+        $refreshDays = (int) config('sso.refresh_token_days', 7);
+
+        $accessToken = JwtToken::encode([
+            'sub' => $user->id,
+            'username' => $user->username,
+            'session_id' => $session->id,
+            'type' => 'access',
+        ], $accessMinutes * 60);
+
+        $refreshToken = JwtToken::encode([
+            'sub' => $user->id,
+            'session_id' => $session->id,
+            'type' => 'refresh',
+        ], $refreshDays * 86400);
+
+        $session->update([
+            'refresh_token' => $refreshToken,
+            'refresh_expires_at' => now()->addDays($refreshDays),
+        ]);
+
+        return [
+            'access_token' => $accessToken,
+            'expires_in' => $accessMinutes * 60,
+            'refresh_token' => $refreshToken,
+            'refresh_expires_in' => $refreshDays * 86400,
+        ];
     }
 
     /**
