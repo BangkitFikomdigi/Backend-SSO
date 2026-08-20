@@ -450,14 +450,13 @@ class AuthController extends Controller
     }
 
     /**
-     * Dipakai untuk 2 hal:
-     * 1. Cek status sesi saat ini (dipanggil tanpa Authorization header).
-     * 2. Tombol "Lanjutkan" setelah sesi jadi 'inactive' karena idle 30 menit:
-     *    kirim access_token yang masih dimiliki user via Authorization: Bearer
-     *    -> jika token itu masih valid (belum lewat 1 hari), sesi langsung
-     *    diaktifkan lagi TANPA login ulang / OTP. Tidak ada token baru yang
-     *    diterbitkan di sini karena access_token & refresh_token yang lama
-     *    memang belum kadaluarsa.
+     * Endpoint status/polling session (dipanggil tanpa perlu Authorization
+     * header - cuma butuh session_id). Kalau session ternyata 'inactive'
+     * (idle > 30 menit) DAN request ini menyertakan Authorization: Bearer
+     * access_token yang masih match session tsb, session langsung di-RESUME
+     * di sini juga - sama seperti /auth/validate, cuma endpoint ini tidak
+     * mewajibkan Authorization header (jadi juga bisa dipakai sekadar untuk
+     * lihat status tanpa efek samping apa pun).
      */
     public function session(Request $request)
     {
@@ -471,9 +470,9 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'Session tidak ditemukan'], 404);
         }
 
-        // Sesi 'active' yang idle-nya sudah lewat 30 menit -> turunkan jadi
-        // 'inactive' (bukan 'expired'): token JWT-nya sendiri masih berlaku.
-        $this->demoteIfIdle($session);
+        if ($session->status === 'active' && $this->isIdle($session)) {
+            $session->update(['status' => 'inactive']);
+        }
 
         if ($session->status === 'inactive') {
             $accessToken = $this->bearerToken($request) ?? $request->input('access_token');
@@ -515,10 +514,22 @@ class AuthController extends Controller
 
     /**
      * Validasi access_token (JWT, dikirim via Authorization: Bearer) untuk
-     * otorisasi API. Berhasil di sini = dianggap "aktivitas user", jadi
-     * jendela inactivity-timeout 30 menit pada layer session ikut di-reset
-     * (sliding window), terpisah dari masa berlaku access_token itu sendiri
-     * (fixed 1 hari, tidak diperpanjang di sini).
+     * otorisasi API.
+     *
+     * Selama JWT access_token itu sendiri masih valid (belum lewat 1 hari),
+     * request ini SELALU dianggap berhasil - termasuk kalau session-nya
+     * sempat 'inactive' karena idle > 30 menit. Tidak ada langkah tambahan
+     * (tidak perlu panggil endpoint lain) untuk "melanjutkan": begitu ada
+     * request tervalidasi lagi, session otomatis di-EXTEND (kalau masih
+     * dalam 30 menit) atau di-RESUME (kalau sempat idle), lalu jendela
+     * inactivity 30 menit direset dari sekarang.
+     *
+     * Login ulang + OTP dari nol HANYA diperlukan kalau:
+     * - access_token sudah lewat 1 hari (JwtToken::decode gagal di bawah) -
+     *   dalam kasus ini frontend harusnya coba /auth/refresh dulu, bukan
+     *   langsung login ulang; atau
+     * - session sudah benar-benar dihapus dari server (logout, atau refresh
+     *   token sudah lewat 7 hari).
      */
     public function validateToken(Request $request)
     {
@@ -537,37 +548,28 @@ class AuthController extends Controller
 
         $payload = JwtToken::decode($token);
         if (! $payload || ($payload['type'] ?? null) !== 'access' || empty($payload['session_id'])) {
-            return response()->json(['success' => false, 'valid' => false, 'message' => 'Access token tidak valid atau kadaluarsa'], 401);
+            return response()->json(['success' => false, 'valid' => false, 'message' => 'Access token tidak valid atau kadaluarsa. Coba /auth/refresh, atau login ulang jika refresh_token juga sudah kadaluarsa.'], 401);
         }
 
-        // 'active' DAN 'inactive' sengaja sama-sama dicari di sini supaya kita
-        // bisa membedakan pesan errornya: sesi idle (inactive, token masih
-        // hidup) vs sesi yang sudah benar-benar mati (logout / expired).
+        // 'active' DAN 'inactive' sama-sama dicari: keduanya sama-sama masih
+        // punya baris session yang hidup, bedanya cuma idle atau tidak - dan
+        // token yang lolos decode di atas jadi bukti sah untuk resume-nya.
         $session = SsoSession::where('id', $payload['session_id'])
             ->whereIn('status', ['active', 'inactive'])
             ->first();
 
         if (! $session) {
-            return response()->json(['success' => false, 'valid' => false, 'message' => 'Session tidak ditemukan. Silakan login ulang.'], 401);
+            return response()->json(['success' => false, 'valid' => false, 'message' => 'Session tidak ditemukan (sudah logout / expired). Silakan login ulang.'], 401);
         }
 
-        if ($session->status === 'inactive' || $this->demoteIfIdle($session)) {
-            return response()->json([
-                'success' => false,
-                'valid' => false,
-                'message' => 'Session tidak aktif karena tidak ada aktivitas selama 30 menit. Klik "Lanjutkan" untuk melanjutkan tanpa login ulang.',
-                'data' => [
-                    'session_id' => $session->id,
-                    'session_status' => 'inactive',
-                ],
-            ], 401);
-        }
+        $wasResumed = $session->status === 'inactive' || $this->isIdle($session);
 
-        // Session masih 'active': request ini terhitung aktivitas -> geser
-        // jendela inactivity 30 menit (last_activity_at), terpisah dari masa
-        // berlaku access_token itu sendiri (fixed 1 hari, tidak diperpanjang di sini).
+        // Extend (kalau masih dalam 30 menit) atau resume (kalau sempat idle)
+        // - dua-duanya sama saja secara teknis: set 'active' + geser jendela
+        // inactivity dari sekarang.
         $activeMinutes = (int) config('sso.session_active_minutes', 30);
         $session->update([
+            'status' => 'active',
             'last_activity_at' => now(),
             'expires_at' => now()->addMinutes($activeMinutes),
         ]);
@@ -579,6 +581,7 @@ class AuthController extends Controller
             'valid' => true,
             'data' => [
                 'session_id' => $session->id,
+                'resumed' => $wasResumed,
                 'time_remaining' => $this->minutesRemaining($session->expires_at),
                 'user' => $this->userPayload($user),
             ],
@@ -695,31 +698,17 @@ class AuthController extends Controller
     }
 
     /**
-     * Jika sesi 'active' sudah idle lebih dari session_active_minutes (dihitung
-     * dari last_activity_at, fallback ke created_at kalau belum pernah diisi),
-     * turunkan statusnya jadi 'inactive' dan simpan. Return true kalau baru
-     * saja diturunkan (atau memang statusnya sudah 'inactive' sebelumnya).
+     * Cek murni (tanpa efek samping/DB write) apakah sesi 'active' sudah
+     * idle lebih dari session_active_minutes, dihitung dari last_activity_at
+     * (fallback ke created_at kalau belum pernah diisi, mis. sesi lama
+     * sebelum kolom ini ada).
      */
-    private function demoteIfIdle(SsoSession $session): bool
+    private function isIdle(SsoSession $session): bool
     {
-        if ($session->status === 'inactive') {
-            return true;
-        }
-
-        if ($session->status !== 'active') {
-            return false;
-        }
-
         $activeMinutes = (int) config('sso.session_active_minutes', 30);
         $lastActivity = $session->last_activity_at ?? $session->created_at ?? now();
 
-        if (now()->greaterThan($lastActivity->copy()->addMinutes($activeMinutes))) {
-            $session->update(['status' => 'inactive']);
-
-            return true;
-        }
-
-        return false;
+        return now()->greaterThan($lastActivity->copy()->addMinutes($activeMinutes));
     }
 
     private function bearerToken(Request $request): ?string
