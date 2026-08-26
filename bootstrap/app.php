@@ -14,11 +14,6 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        // Frontend PHP berjalan di origin/port berbeda, jadi API perlu CORS.
-        $middleware->api(prepend: [
-            \Illuminate\Http\Middleware\HandleCors::class,
-        ]);
-
         $middleware->validateCsrfTokens(except: [
             'auth/*',
             'admin/*',

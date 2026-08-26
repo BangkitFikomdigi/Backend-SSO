@@ -46,3 +46,8 @@ Route::prefix('api/auth')->group(function () {
 Route::post('/login', [AuthController::class, 'login']);
 
 Route::get('/admin/login-activities', [AdminController::class, 'loginActivities']);
+
+// Handle CORS preflight OPTIONS request untuk semua route
+Route::options('/{any}', function () {
+    return response()->json();
+})->where('any', '.*');

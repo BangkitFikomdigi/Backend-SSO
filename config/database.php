@@ -64,6 +64,30 @@ return [
             ]) : [],
         ],
 
+        // ===== Koneksi kedua: database SIMRS (db_online_simulasi) =====
+        // Dipakai khusus untuk query tabel tb_user saat login (lihat
+        // AuthController::resolveUserFromCredentials()). Koneksi 'mysql'
+        // di atas TETAP dipakai untuk tabel-tabel SSO (sso_sessions,
+        // login_activities, modules, dst) di database fullstack_sso.
+        'simrs' => [
+            'driver' => 'mysql',
+            'host' => env('DB_SIMRS_HOST', '127.0.0.1'),
+            'port' => env('DB_SIMRS_PORT', '3306'),
+            'database' => env('DB_SIMRS_DATABASE', 'db_online_simulasi'),
+            'username' => env('DB_SIMRS_USERNAME', 'root'),
+            'password' => env('DB_SIMRS_PASSWORD', ''),
+            'unix_socket' => env('DB_SOCKET', ''),
+            'charset' => 'utf8mb4',
+            'collation' => 'utf8mb4_unicode_ci',
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'strict' => true,
+            'engine' => null,
+            'options' => extension_loaded('pdo_mysql') ? array_filter([
+                Mysql::ATTR_SSL_CA => env('MYSQL_ATTR_SSL_CA'),
+            ]) : [],
+        ],
+
         'mariadb' => [
             'driver' => 'mariadb',
             'url' => env('DB_URL'),

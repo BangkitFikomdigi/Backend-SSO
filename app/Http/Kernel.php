@@ -16,8 +16,7 @@ class Kernel extends HttpKernel
     protected $middleware = [
         // \App\Http\Middleware\TrustHosts::class,
         \App\Http\Middleware\TrustProxies::class,
-        \Illuminate\Http\Middleware\HandleCors::class,     // <-- BARIS INI (Laravel 10 ke atas)
-        // \Fruitcake\Cors\HandleCors::class,              // <-- ATAU BARIS INI (jika pakai Fruitcake)
+        \App\Http\Middleware\ForceCors::class,
         \App\Http\Middleware\PreventRequestsDuringMaintenance::class,
         \Illuminate\Foundation\Http\Middleware\ValidatePostSize::class,
         \App\Http\Middleware\TrimStrings::class,

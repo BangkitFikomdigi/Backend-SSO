@@ -5,6 +5,7 @@
 // supaya frontend bisa dites dari dua-duanya tanpa ubah config lagi.
 $defaultOrigins = [
     'http://192.168.4.22:5173',
+    'http://192.168.4.23:5173',
     'http://localhost:5173',
     'http://127.0.0.1:5173',
 ];
@@ -18,7 +19,7 @@ return [
     ))),
     'allowed_origins_patterns' => [],
     'allowed_headers' => ['*'],
-    'exposed_headers' => [],
-    'max_age' => 0,
-    'supports_credentials' => true,   // <-- INI YANG PALING PENTING!
+    'exposed_headers' => ['*'],
+    'max_age' => 86400,
+    'supports_credentials' => true,
 ];

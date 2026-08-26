@@ -12,6 +12,7 @@ use App\Support\JwtToken;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
@@ -723,13 +724,22 @@ class AuthController extends Controller
     private function userPayload(?User $user): array
     {
         if (! $user) {
-            return ['username' => null, 'email' => null, 'role' => null, 'modul_akses' => []];
+            return ['username' => null, 'email' => null, 'role' => null, 'name' => null, 'modul_akses' => []];
         }
+
+        // 'name' tidak disimpan di tabel users (fullstack_sso) - diambil
+        // langsung dari tb_user (db_online_simulasi) pakai nik yang sama
+        // dengan $user->username, supaya tidak perlu migration tambahan.
+        $simrsRow = DB::connection('simrs')
+            ->table('tb_user')
+            ->where('nik', $user->username)
+            ->first();
 
         return [
             'username' => $user->username,
             'email' => $user->email,
             'role' => $user->role,
+            'name' => $simrsRow->nama ?? $user->username,
             'modul_akses' => $user->modules()->get(['modules.code', 'modules.name', 'modules.url'])
                 ->map(fn ($m) => ['code' => $m->code, 'name' => $m->name, 'url' => $m->url])
                 ->values(),
@@ -751,30 +761,45 @@ class AuthController extends Controller
         return str_pad((string) random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
     }
 
+    /**
+     * Cari user berdasarkan nik (dipakai sebagai "Username / NIP" di form
+     * login) di tabel tb_user pada database db_online_simulasi (koneksi
+     * 'simrs' - lihat config/database.php), lalu verifikasi password
+     * dengan Hash::check() terhadap kolom `pass` (sudah bcrypt, cost 10 -
+     * sama seperti BCRYPT_ROUNDS Laravel).
+     *
+     * Hasilnya "dijembatani" ke User::updateOrCreate() supaya SsoSession,
+     * LoginActivity, dan relasi modules() (yang hidup di database
+     * fullstack_sso) tetap jalan seperti biasa tanpa perlu diubah.
+     */
     private function resolveUserFromCredentials(string $username, string $password): ?User
     {
-        $dummyUsers = [
-            'admin_simrs' => ['password' => '12#56*DS', 'email' => 'admin.simrs@example.com', 'role' => 'admin'],
-            'dokter_amino' => ['password' => '11#22*AA', 'email' => 'dokter.amino@example.com', 'role' => 'dokter'],
-            'petugas_lapor' => ['password' => '33#44*PL', 'email' => 'petugas.lapor@example.com', 'role' => 'petugas'],
-            'manager_wbs' => ['password' => '55#66*MW', 'email' => 'manager.wbs@example.com', 'role' => 'manager'],
-            'super_user' => ['password' => '77#88*SU', 'email' => 'girlclown666@gmail.com', 'role' => 'super_user'],
-        ];
+        $row = DB::connection('simrs')
+            ->table('tb_user')
+            ->where('nik', $username)
+            ->first();
 
-        if (! array_key_exists($username, $dummyUsers)) {
+        if (! $row || ! $row->pass) {
             return null;
         }
 
-        if (($dummyUsers[$username]['password'] ?? null) !== $password) {
+        if (! Hash::check($password, $row->pass)) {
             return null;
         }
 
+        if (($row->status_verif ?? null) !== 'Aktif') {
+            // Akun belum diaktivasi / masih 'Lupa Password' -> tolak login.
+            return null;
+        }
+
+        // nik dipakai sebagai 'username' stabil di sisi Laravel (unique key),
+        // karena tb_user sendiri tidak punya kolom username.
         return User::updateOrCreate(
-            ['username' => $username],
+            ['username' => $row->nik ?? $row->email],
             [
-                'email' => $dummyUsers[$username]['email'],
-                'role' => $dummyUsers[$username]['role'],
-                'password_hash' => Hash::make($password),
+                'email' => $row->email,
+                'role' => (string) $row->level,
+                'password_hash' => $row->pass, // sudah hash, jangan di-hash ulang
             ]
         );
     }
