@@ -13,6 +13,9 @@ class DatabaseSeeder extends Seeder
      * Data ini persis sama dengan yang di-seed otomatis oleh initDatabase()
      * pada versi Node.js (Backend/server.js), supaya kredensial demo tetap
      * sama untuk seluruh tim.
+     * 
+     * ⚠️ PENTING: username HARUS cocok dengan nik di tb_user (db_online_simulasi)!
+     * Jangan pakai nama role (admin_simrs, dll) - harus pakai NIK asli dari sistem SIMRS.
      */
     public function run(): void
     {
@@ -28,11 +31,11 @@ class DatabaseSeeder extends Seeder
         }
 
         $defaultUsers = [
-            ['username' => 'admin_simrs', 'password' => '12#56*DS', 'modules' => ['SIMRS']],
-            ['username' => 'dokter_amino', 'password' => '11#22*AA', 'modules' => ['AMINO_MOBILE']],
-            ['username' => 'petugas_lapor', 'password' => '33#44*PL', 'modules' => ['LAPOR_AMINO']],
-            ['username' => 'manager_wbs', 'password' => '55#66*MW', 'modules' => ['WBS']],
-            ['username' => 'super_user', 'password' => '77#88*SU', 'email' => 'girlclown666@gmail.com', 'role' => 'super_user', 'modules' => ['SIMRS', 'AMINO_MOBILE', 'LAPOR_AMINO', 'WBS']],
+            ['username' => '3321087007040001', 'email' => 'rchldrgn@gmail.com', 'password' => '12#56*DS', 'role' => 'admin_simrs', 'modules' => ['SIMRS']],
+            ['username' => '3516014205420002', 'email' => 'diyanashulha@gmail.com', 'password' => '11#22*AA', 'role' => 'dokter_amino', 'modules' => ['AMINO_MOBILE']],
+            ['username' => '3212082605810003', 'email' => 'kawaiicompiler@gmail.com', 'password' => '33#44*PL', 'role' => 'petugas_lapor', 'modules' => ['LAPOR_AMINO']],
+            ['username' => '3316080609680004', 'email' => 'karinnyxx21@gmail.com', 'password' => '55#66*MW', 'role' => 'manager_wbs', 'modules' => ['WBS']],
+            ['username' => '3205015307730005', 'email' => 'clowngirl666@gmail.com', 'password' => '77#88*SU', 'role' => 'super_user', 'modules' => ['SIMRS', 'AMINO_MOBILE', 'LAPOR_AMINO', 'WBS']],
         ];
 
         foreach ($defaultUsers as $data) {

