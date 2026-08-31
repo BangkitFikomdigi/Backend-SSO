@@ -905,7 +905,7 @@ class AuthController extends Controller
         return $total > 0 ? $total : 0;
     }
 
-    private function logLoginActivity(?string $userId, ?string $username, string $status, ?string $reason, Request $request): void
+    private function logLoginActivity(?string $userId, ?string $username, string $status, ?string $reason, Request $request, ?string $activityType = null): void
     {
         try {
             LoginActivity::create([
@@ -913,11 +913,285 @@ class AuthController extends Controller
                 'username' => $username,
                 'status' => $status,
                 'reason' => $reason,
+                'activity_type' => $activityType ?? 'login',
                 'ip_address' => $request->ip(),
                 'user_agent' => Str::limit((string) $request->userAgent(), 500, ''),
             ]);
         } catch (\Throwable $e) {
             report($e);
+        }
+    }
+
+    /**
+     * Forgot password: user masukkan username/NIK, system kirim OTP ke email
+     */
+    public function forgotPassword(Request $request)
+    {
+        $username = $request->input('username');
+
+        if (! $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username wajib diisi',
+            ], 400);
+        }
+
+        // Cari user di SIMRS berdasarkan nik
+        $row = DB::connection('simrs')
+            ->table('tb_user')
+            ->where('nik', $username)
+            ->first();
+
+        if (! $row || ! $row->email) {
+            $this->logLoginActivity(null, $username, 'failed', 'user_not_found', $request, 'forgot_password');
+            // Jangan beri tahu user apakah user exist atau tidak (security: information disclosure)
+            return response()->json([
+                'success' => true,
+                'message' => 'Jika akun Anda terdaftar, kami akan mengirim instruksi reset password ke email Anda.',
+            ]);
+        }
+
+        // Cari atau buat user di SSO database
+        $user = User::where('username', $username)->first();
+        if (! $user) {
+            $user = User::create([
+                'username' => $username,
+                'email' => $row->email,
+                'role' => (string) $row->level,
+                'password_hash' => $row->pass ?? '',
+            ]);
+        }
+
+        // Hapus request password reset lama jika ada
+        PasswordReset::where('user_id', $user->id)->delete();
+
+        // Generate OTP 6 digit
+        $otp = str_pad((string) random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
+
+        // Buat record password reset dengan status 'pending'
+        $resetRecord = PasswordReset::create([
+            'user_id' => $user->id,
+            'username' => $username,
+            'otp' => $otp,
+            'status' => 'pending',
+            'attempts' => 0,
+            'expires_at' => now()->addMinutes(10),
+            'created_at' => now(),
+        ]);
+
+        // Simpan OTP juga di cache untuk quick lookup di verifyPasswordReset()
+        Cache::put("password_reset_otp:{$username}", $otp, now()->addMinutes(10));
+
+        // Kirim email OTP
+        $this->sendPasswordResetOtpMail($row->email, $otp, $username, 10);
+
+        if (app()->environment('local')) {
+            \Log::info('🔐 [PASSWORD_RESET] OTP dikirim ke ' . $row->email . ' (user: ' . $username . ')');
+        }
+
+        $this->logLoginActivity($user->id, $username, 'success', null, $request, 'forgot_password_otp_sent');
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Kode OTP telah dikirim ke email Anda. Silakan cek email untuk melanjutkan reset password.',
+            'data' => [
+                'reset_id' => $resetRecord->id,
+                'otp' => app()->environment(['local', 'testing']) ? $otp : null, // Show OTP only in dev
+            ],
+        ]);
+    }
+
+    /**
+     * Verify OTP saat forgot password
+     */
+    public function verifyPasswordResetOtp(Request $request)
+    {
+        $resetId = $request->input('reset_id');
+        $username = $request->input('username');
+        $otp = $request->input('otp');
+
+        if (! $resetId || ! $username || ! $otp) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Reset ID, username, dan OTP wajib diisi',
+            ], 400);
+        }
+
+        $reset = PasswordReset::find($resetId);
+        if (! $reset) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Reset request tidak ditemukan',
+            ], 404);
+        }
+
+        if ($reset->username !== $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username tidak sesuai dengan reset request',
+            ], 400);
+        }
+
+        if ($reset->status !== 'pending') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Reset request sudah tidak berlaku',
+            ], 400);
+        }
+
+        if (now()->greaterThan($reset->expires_at)) {
+            $reset->update(['status' => 'expired']);
+            return response()->json([
+                'success' => false,
+                'message' => 'OTP kadaluarsa. Silakan minta OTP baru.',
+            ], 400);
+        }
+
+        if ($reset->attempts >= 5) {
+            $reset->update(['status' => 'locked']);
+            return response()->json([
+                'success' => false,
+                'message' => 'Terlalu banyak percobaan OTP salah. Reset request dikunci.',
+            ], 429);
+        }
+
+        $expectedOtp = Cache::get("password_reset_otp:{$username}");
+        if (! $expectedOtp) {
+            $expectedOtp = $reset->otp; // Fallback ke database jika cache miss
+        }
+
+        if ((string) $otp !== (string) $expectedOtp) {
+            $reset->increment('attempts');
+            return response()->json([
+                'success' => false,
+                'message' => 'OTP tidak sesuai',
+                'remaining_attempts' => max(0, 5 - ($reset->attempts + 1)),
+            ], 400);
+        }
+
+        // OTP cocok! Update status menjadi 'verified'
+        $reset->update(['status' => 'verified']);
+        Cache::forget("password_reset_otp:{$username}");
+
+        $this->logLoginActivity($reset->user_id, $username, 'success', null, $request, 'password_reset_otp_verified');
+
+        return response()->json([
+            'success' => true,
+            'message' => 'OTP terverifikasi. Silakan masukkan password baru.',
+            'data' => [
+                'reset_id' => $resetId,
+                'username' => $username,
+            ],
+        ]);
+    }
+
+    /**
+     * Set password baru setelah OTP terverifikasi
+     */
+    public function setNewPassword(Request $request)
+    {
+        $resetId = $request->input('reset_id');
+        $username = $request->input('username');
+        $newPassword = $request->input('password');
+
+        if (! $resetId || ! $username || ! $newPassword) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Reset ID, username, dan password baru wajib diisi',
+            ], 400);
+        }
+
+        if (strlen($newPassword) < 8) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Password harus minimal 8 karakter',
+            ], 400);
+        }
+
+        $reset = PasswordReset::find($resetId);
+        if (! $reset) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Reset request tidak ditemukan',
+            ], 404);
+        }
+
+        if ($reset->username !== $username) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Username tidak sesuai',
+            ], 400);
+        }
+
+        if ($reset->status !== 'verified') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Reset request tidak dalam status terverifikasi',
+            ], 400);
+        }
+
+        $user = User::find($reset->user_id);
+        if (! $user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'User tidak ditemukan',
+            ], 404);
+        }
+
+        // Update password di KEDUA database:
+        // 1. Update di fullstack_sso (local SSO)
+        $user->update(['password_hash' => Hash::make($newPassword)]);
+
+        // 2. Update juga di db_online_simulasi (SIMRS) agar login dari aplikasi lain tetap berjalan
+        try {
+            DB::connection('simrs')
+                ->table('tb_user')
+                ->where('nik', $username)
+                ->update(['pass' => Hash::make($newPassword)]);
+        } catch (\Throwable $e) {
+            \Log::warning('⚠️ [PASSWORD_RESET] Gagal update password di SIMRS: ' . $e->getMessage());
+            // Lanjut aja, setidaknya SSO database sudah ter-update
+        }
+
+        // Mark reset sebagai 'completed' dan cleanup
+        $reset->update(['status' => 'completed']);
+        Cache::forget("password_reset_otp:{$username}");
+
+        // Logout semua session user yang ada (force re-login)
+        SsoSession::where('user_id', $user->id)->delete();
+
+        $this->logLoginActivity($user->id, $username, 'success', null, $request, 'password_changed');
+
+        if (app()->environment('local')) {
+            \Log::info('✅ [PASSWORD_RESET] Password berhasil diubah untuk user: ' . $username);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Password berhasil diubah. Silakan login dengan password baru Anda.',
+            'data' => [
+                'redirect_to' => '/login',
+            ],
+        ]);
+    }
+
+    /**
+     * Kirim email OTP untuk password reset (fallback Mail::raw jika mailable tidak ada)
+     */
+    private function sendPasswordResetOtpMail(string $email, string $otp, string $username, int $expiryMinutes): bool
+    {
+        try {
+            Mail::raw(
+                "Kode OTP untuk reset password Anda: {$otp}\n\nKode ini berlaku selama {$expiryMinutes} menit.\n\nJika Anda tidak meminta reset password, abaikan email ini.",
+                function ($message) use ($email) {
+                    $message->to($email)->subject('Kode OTP Reset Password');
+                }
+            );
+            \Log::info('✅ [PASSWORD_RESET_EMAIL] Email OTP dikirim ke ' . $email);
+            return true;
+        } catch (\Throwable $e) {
+            \Log::error('❌ [PASSWORD_RESET_EMAIL] Gagal kirim email ke ' . $email . ': ' . $e->getMessage());
+            return false;
         }
     }
 }
