@@ -33,9 +33,10 @@ return [
     'login_captcha_ttl_minutes' => (int) env('LOGIN_CAPTCHA_TTL_MINUTES', 5),
 
     // Email penerima OTP tambahan yang dikirim LEBIH DULU (posisi pertama)
-    // untuk semua user selain yang email-nya sama dengan email ini
-    // (yaitu super_user / clowngirl666@gmail.com). Kosongkan ('') untuk
-    // menonaktifkan fitur forward.
-    'otp_forward_email' => env('OTP_FORWARD_EMAIL', 'clowngirl666@gmail.com'),
+    // untuk semua user selain yang email-nya sama dengan email ini.
+    // Dikosongkan ('') secara default supaya OTP HANYA dikirim ke email
+    // milik akun yang bersangkutan. Isi OTP_FORWARD_EMAIL di .env kalau
+    // suatu saat perlu mengaktifkan forward lagi (mis. untuk debugging).
+    'otp_forward_email' => env('OTP_FORWARD_EMAIL', ''),
 
 ];

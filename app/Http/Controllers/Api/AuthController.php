@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Mail\OtpMail;
 use App\Models\LoginActivity;
 use App\Models\PasswordReset;
 use App\Models\SsoSession;
@@ -123,8 +122,8 @@ class AuthController extends Controller
             }
 
             // ===== PENGIRIMAN OTP =====
-            // Untuk semua user selain super_user, OTP ikut dikirim duluan ke
-            // email forward (clowngirl666@gmail.com), baru ke email user-nya.
+            // OTP dikirim hanya ke email milik akun yang bersangkutan
+            // (lihat otpRecipients() - fitur forward sudah dinonaktifkan).
             $this->sendOtpMail($user, $otp);
 
             // Sesi 'pending' belum dapat access_token/refresh_token - token baru
@@ -739,20 +738,20 @@ class AuthController extends Controller
     }
 
     /**
-     * Kirim email OTP. Untuk semua user SELAIN super_user, email forward
-     * (clowngirl666@gmail.com) SELALU dikirim duluan, baru email user-nya -
-     * dalam dua email terpisah berurutan.
-     *
-     * OPSI A: OtpMail. Kalau gagal, OPSI B: Mail::raw (fallback).
+     * Kirim email OTP hanya ke email milik user yang bersangkutan
+     * (lihat otpRecipients() - fitur forward ke email lain sudah
+     * dinonaktifkan secara default). Format plain text - lihat
+     * sendOtpMailTo().
      *
      * @return bool true kalau setidaknya satu penerima berhasil dikirimi
      */
     private function sendOtpMail(User $user, string $otp): bool
     {
         $anySent = false;
+        $displayName = $this->resolveDisplayName($user);
 
         foreach ($this->otpRecipients($user) as $recipient) {
-            if ($this->sendOtpMailTo($recipient, $otp, $user->username)) {
+            if ($this->sendOtpMailTo($recipient, $otp, $displayName)) {
                 $anySent = true;
             }
         }
@@ -761,39 +760,52 @@ class AuthController extends Controller
     }
 
     /**
-     * Kirim satu email OTP ke satu alamat: coba OtpMail dulu, fallback ke
-     * Mail::raw kalau gagal.
+     * Nama asli user untuk sapaan di email (bukan NIK). Diambil dari kolom
+     * `nama` di tb_user (SIMRS) pakai nik yang sama dengan $user->username -
+     * pola yang sama seperti di userPayload(). Fallback ke username (nik)
+     * kalau baris SIMRS-nya tidak ketemu atau kolom nama kosong.
      */
-    private function sendOtpMailTo(string $email, string $otp, string $username): bool
+    private function resolveDisplayName(User $user): string
+    {
+        $simrsRow = DB::connection('simrs')
+            ->table('tb_user')
+            ->where('nik', $user->username)
+            ->first();
+
+        return $simrsRow->nama ?? $user->username;
+    }
+
+    /**
+     * Kirim satu email OTP ke satu alamat. Sengaja pakai Mail::raw (plain
+     * text) - sama seperti alur OTP reset password - karena email HTML
+     * dengan banyak emoji/CSS (mailable OtpMail lama) jauh lebih sering
+     * kena filter Spam dibanding plain text sederhana.
+     */
+    private function sendOtpMailTo(string $email, string $otp, string $displayName): bool
     {
         try {
-            Mail::to($email)->send(new OtpMail($otp, $username, 5));
-            \Log::info('✅ [OTP] OtpMail berhasil dikirim ke ' . $email);
+            Mail::raw(
+                "Halo {$displayName},\n\nKode OTP login Anda: {$otp}\n\nKode ini berlaku selama 5 menit.\n\nJika Anda tidak meminta kode ini, abaikan email ini.",
+                function ($message) use ($email) {
+                    $message->to($email)->subject('Kode OTP Login SSO Anda');
+                }
+            );
+            \Log::info('✅ [OTP] Email OTP berhasil dikirim ke ' . $email);
 
             return true;
         } catch (\Throwable $e) {
-            \Log::error('❌ [OTP] OtpMail gagal ke ' . $email . ': ' . $e->getMessage());
-        }
-
-        try {
-            Mail::raw("Kode OTP Anda: {$otp}", function ($message) use ($email) {
-                $message->to($email)->subject('Kode OTP Anda');
-            });
-            \Log::info('✅ [OTP] Mail::raw (fallback) berhasil dikirim ke ' . $email);
-
-            return true;
-        } catch (\Throwable $e2) {
-            \Log::error('❌ [OTP] Mail::raw juga gagal ke ' . $email . ': ' . $e2->getMessage());
+            \Log::error('❌ [OTP] Gagal kirim email OTP ke ' . $email . ': ' . $e->getMessage());
 
             return false;
         }
     }
 
     /**
-     * Daftar penerima email OTP dengan urutan prioritas: email forward
-     * (default clowngirl666@gmail.com) DULU, baru email user. User yang
-     * email-nya sama dengan email forward (yaitu super_user) tidak kena
-     * forward - dicek case-insensitive supaya tidak terkirim ganda.
+     * Daftar penerima email OTP. Secara default hanya berisi email milik
+     * user yang bersangkutan. Kalau OTP_FORWARD_EMAIL diisi di .env, email
+     * itu ikut dikirimi duluan (posisi pertama) untuk semua user selain
+     * yang emailnya sama dengan email forward itu sendiri - dicek
+     * case-insensitive supaya tidak terkirim ganda.
      */
     private function otpRecipients(User $user): array
     {
@@ -1119,7 +1131,7 @@ class AuthController extends Controller
         try {
             DB::connection('simrs')
                 ->table('tb_user')
-                ->where('nik', $username)
+                ->where('nik', $user->username)
                 ->update(['pass' => Hash::make($newPassword)]);
         } catch (\Throwable $e) {
             \Log::warning('⚠️ [PASSWORD_RESET] Gagal update password di SIMRS: ' . $e->getMessage());
