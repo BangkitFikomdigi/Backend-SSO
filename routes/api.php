@@ -45,6 +45,10 @@ Route::prefix('api/auth')->group(function () {
     Route::post('/validate', [AuthController::class, 'validateToken']);
     Route::post('/refresh', [AuthController::class, 'refresh']);
     Route::delete('/logout', [AuthController::class, 'logout']);
+    // Forgot password flow
+    Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
+    Route::post('/verify-password-reset-otp', [AuthController::class, 'verifyPasswordResetOtp']);
+    Route::post('/set-new-password', [AuthController::class, 'setNewPassword']);
 });
 
 Route::post('/login', [AuthController::class, 'login']);

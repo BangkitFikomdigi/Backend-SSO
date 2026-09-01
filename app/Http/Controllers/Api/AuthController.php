@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Mail\OtpMail;
 use App\Models\LoginActivity;
+use App\Models\PasswordReset;
 use App\Models\SsoSession;
 use App\Models\User;
 use App\Support\CaptchaGenerator;
@@ -923,42 +924,28 @@ class AuthController extends Controller
     }
 
     /**
-     * Forgot password: user masukkan username/NIK, system kirim OTP ke email
+     * Forgot password: user masukkan email, system kirim OTP ke email
      */
     public function forgotPassword(Request $request)
     {
-        $username = $request->input('username');
+        $email = $request->input('email');
 
-        if (! $username) {
+        if (! $email) {
             return response()->json([
                 'success' => false,
-                'message' => 'Username wajib diisi',
+                'message' => 'Email wajib diisi',
             ], 400);
         }
 
-        // Cari user di SIMRS berdasarkan nik
-        $row = DB::connection('simrs')
-            ->table('tb_user')
-            ->where('nik', $username)
-            ->first();
+        // Cari user di SSO database berdasarkan email
+        $user = User::where('email', $email)->first();
 
-        if (! $row || ! $row->email) {
-            $this->logLoginActivity(null, $username, 'failed', 'user_not_found', $request, 'forgot_password');
-            // Jangan beri tahu user apakah user exist atau tidak (security: information disclosure)
+        if (! $user) {
+            $this->logLoginActivity(null, $email, 'failed', 'user_not_found', $request, 'forgot_password');
+            // Jangan beri tahu user apakah email exist atau tidak (security: information disclosure)
             return response()->json([
                 'success' => true,
-                'message' => 'Jika akun Anda terdaftar, kami akan mengirim instruksi reset password ke email Anda.',
-            ]);
-        }
-
-        // Cari atau buat user di SSO database
-        $user = User::where('username', $username)->first();
-        if (! $user) {
-            $user = User::create([
-                'username' => $username,
-                'email' => $row->email,
-                'role' => (string) $row->level,
-                'password_hash' => $row->pass ?? '',
+                'message' => 'Jika email Anda terdaftar, kami akan mengirim instruksi reset password ke email Anda.',
             ]);
         }
 
@@ -971,7 +958,7 @@ class AuthController extends Controller
         // Buat record password reset dengan status 'pending'
         $resetRecord = PasswordReset::create([
             'user_id' => $user->id,
-            'username' => $username,
+            'username' => $user->username,
             'otp' => $otp,
             'status' => 'pending',
             'attempts' => 0,
@@ -979,17 +966,17 @@ class AuthController extends Controller
             'created_at' => now(),
         ]);
 
-        // Simpan OTP juga di cache untuk quick lookup di verifyPasswordReset()
-        Cache::put("password_reset_otp:{$username}", $otp, now()->addMinutes(10));
+        // Simpan OTP juga di cache untuk quick lookup di verifyPasswordResetOtp()
+        Cache::put("password_reset_otp:{$email}", $otp, now()->addMinutes(10));
 
         // Kirim email OTP
-        $this->sendPasswordResetOtpMail($row->email, $otp, $username, 10);
+        $this->sendPasswordResetOtpMail($email, $otp, $user->username, 10);
 
         if (app()->environment('local')) {
-            \Log::info('🔐 [PASSWORD_RESET] OTP dikirim ke ' . $row->email . ' (user: ' . $username . ')');
+            \Log::info('🔐 [PASSWORD_RESET] OTP dikirim ke ' . $email . ' (user: ' . $user->username . ')');
         }
-
-        $this->logLoginActivity($user->id, $username, 'success', null, $request, 'forgot_password_otp_sent');
+        
+        $this->logLoginActivity($user->id, $user->username, 'success', null, $request, 'forgot_password_otp_sent');
 
         return response()->json([
             'success' => true,
@@ -1007,13 +994,13 @@ class AuthController extends Controller
     public function verifyPasswordResetOtp(Request $request)
     {
         $resetId = $request->input('reset_id');
-        $username = $request->input('username');
+        $email = $request->input('email');
         $otp = $request->input('otp');
 
-        if (! $resetId || ! $username || ! $otp) {
+        if (! $resetId || ! $email || ! $otp) {
             return response()->json([
                 'success' => false,
-                'message' => 'Reset ID, username, dan OTP wajib diisi',
+                'message' => 'Reset ID, email, dan OTP wajib diisi',
             ], 400);
         }
 
@@ -1023,13 +1010,6 @@ class AuthController extends Controller
                 'success' => false,
                 'message' => 'Reset request tidak ditemukan',
             ], 404);
-        }
-
-        if ($reset->username !== $username) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Username tidak sesuai dengan reset request',
-            ], 400);
         }
 
         if ($reset->status !== 'pending') {
@@ -1055,7 +1035,7 @@ class AuthController extends Controller
             ], 429);
         }
 
-        $expectedOtp = Cache::get("password_reset_otp:{$username}");
+        $expectedOtp = Cache::get("password_reset_otp:{$email}");
         if (! $expectedOtp) {
             $expectedOtp = $reset->otp; // Fallback ke database jika cache miss
         }
@@ -1071,16 +1051,16 @@ class AuthController extends Controller
 
         // OTP cocok! Update status menjadi 'verified'
         $reset->update(['status' => 'verified']);
-        Cache::forget("password_reset_otp:{$username}");
+        Cache::forget("password_reset_otp:{$email}");
 
-        $this->logLoginActivity($reset->user_id, $username, 'success', null, $request, 'password_reset_otp_verified');
+        $this->logLoginActivity($reset->user_id, $reset->username, 'success', null, $request, 'password_reset_otp_verified');
 
         return response()->json([
             'success' => true,
             'message' => 'OTP terverifikasi. Silakan masukkan password baru.',
             'data' => [
                 'reset_id' => $resetId,
-                'username' => $username,
+                'email' => $email,
             ],
         ]);
     }
@@ -1091,13 +1071,13 @@ class AuthController extends Controller
     public function setNewPassword(Request $request)
     {
         $resetId = $request->input('reset_id');
-        $username = $request->input('username');
+        $email = $request->input('email');
         $newPassword = $request->input('password');
 
-        if (! $resetId || ! $username || ! $newPassword) {
+        if (! $resetId || ! $email || ! $newPassword) {
             return response()->json([
                 'success' => false,
-                'message' => 'Reset ID, username, dan password baru wajib diisi',
+                'message' => 'Reset ID, email, dan password baru wajib diisi',
             ], 400);
         }
 
@@ -1114,13 +1094,6 @@ class AuthController extends Controller
                 'success' => false,
                 'message' => 'Reset request tidak ditemukan',
             ], 404);
-        }
-
-        if ($reset->username !== $username) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Username tidak sesuai',
-            ], 400);
         }
 
         if ($reset->status !== 'verified') {
@@ -1155,15 +1128,15 @@ class AuthController extends Controller
 
         // Mark reset sebagai 'completed' dan cleanup
         $reset->update(['status' => 'completed']);
-        Cache::forget("password_reset_otp:{$username}");
+        Cache::forget("password_reset_otp:{$email}");
 
         // Logout semua session user yang ada (force re-login)
         SsoSession::where('user_id', $user->id)->delete();
 
-        $this->logLoginActivity($user->id, $username, 'success', null, $request, 'password_changed');
+        $this->logLoginActivity($user->id, $user->username, 'success', null, $request, 'password_changed');
 
         if (app()->environment('local')) {
-            \Log::info('✅ [PASSWORD_RESET] Password berhasil diubah untuk user: ' . $username);
+            \Log::info('✅ [PASSWORD_RESET] Password berhasil diubah untuk user: ' . $user->username);
         }
 
         return response()->json([
